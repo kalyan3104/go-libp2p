@@ -2,10 +2,12 @@ package swarm
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sync"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/canonicallog"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 
@@ -67,6 +69,8 @@ type addrDial struct {
 	createdAt time.Time
 	// dialRankingDelay is the delay in dialing this address introduced by the ranking logic
 	dialRankingDelay time.Duration
+	// startTime is the dialStartTime
+	startTime time.Time
 }
 
 // dialWorker synchronises concurrent dials to a peer. It ensures that we make at most one dial to a
@@ -156,6 +160,17 @@ loop:
 			if !ok {
 				if w.s.metricsTracer != nil {
 					w.s.metricsTracer.DialCompleted(w.connected, totalDials)
+				}
+				for dialsInFlight > 0 {
+					res := <-w.resch
+					// We're recording any error as a failure here.
+					// Notably, this also applies to cancelations (i.e. if another dial attempt was faster).
+					// This is ok since the black hole detector uses a very low threshold (5%).
+					w.s.bhd.RecordResult(res.Addr, res.Err == nil)
+					if res.Conn != nil {
+						res.Conn.Close()
+					}
+					dialsInFlight--
 				}
 				return
 			}
@@ -308,62 +323,100 @@ loop:
 			// Update all requests waiting on this address. On success, complete the request.
 			// On error, record the error
 
-			dialsInFlight--
 			ad, ok := w.trackedDials[string(res.Addr.Bytes())]
 			if !ok {
 				log.Errorf("SWARM BUG: no entry for address %s in trackedDials", res.Addr)
 				if res.Conn != nil {
 					res.Conn.Close()
 				}
+				// It is better to decrement the dials in flight and schedule one extra dial
+				// than risking not closing the worker loop on cleanup
+				dialsInFlight--
 				continue
 			}
 
+			if res.Kind == DialStarted {
+				ad.startTime = w.cl.Now()
+				scheduleNextDial()
+				continue
+			}
+
+			dialsInFlight--
+			// We're recording any error as a failure here.
+			// Notably, this also applies to cancelations (i.e. if another dial attempt was faster).
+			// This is ok since the black hole detector uses a very low threshold (5%).
+			w.s.bhd.RecordResult(ad.addr, res.Err == nil)
+
 			if res.Conn != nil {
-				// we got a connection, add it to the swarm
-				conn, err := w.s.addConn(res.Conn, network.DirOutbound)
-				if err != nil {
-					// oops no, we failed to add it to the swarm
-					res.Conn.Close()
-					w.dispatchError(ad, err)
-					continue loop
-				}
+				w.handleSuccess(ad, res)
+			} else {
+				w.handleError(ad, res)
 
-				for pr := range w.pendingRequests {
-					if pr.addrs[string(ad.addr.Bytes())] {
-						pr.req.resch <- dialResponse{conn: conn}
-						delete(w.pendingRequests, pr)
-					}
-				}
-
-				ad.conn = conn
-				if !w.connected {
-					w.connected = true
-					if w.s.metricsTracer != nil {
-						w.s.metricsTracer.DialRankingDelay(ad.dialRankingDelay)
-					}
-				}
-
-				continue loop
 			}
-
-			// it must be an error -- add backoff if applicable and dispatch
-			// ErrDialRefusedBlackHole shouldn't end up here, just a safety check
-			if res.Err != ErrDialRefusedBlackHole && res.Err != context.Canceled && !w.connected {
-				// we only add backoff if there has not been a successful connection
-				// for consistency with the old dialer behavior.
-				w.s.backf.AddBackoff(w.peer, res.Addr)
-			} else if res.Err == ErrDialRefusedBlackHole {
-				log.Errorf("SWARM BUG: unexpected ErrDialRefusedBlackHole while dialing peer %s to addr %s",
-					w.peer, res.Addr)
-			}
-
-			w.dispatchError(ad, res.Err)
-			// Only schedule next dial on error.
-			// If we scheduleNextDial on success, we will end up making one dial more than
-			// required because the final successful dial will spawn one more dial
 			scheduleNextDial()
 		}
 	}
+}
+
+func (w *dialWorker) handleSuccess(ad *addrDial, res dialResult) {
+	// Ensure we connected to the correct peer.
+	// This was most likely already checked by the security protocol, but it doesn't hurt do it again here.
+	if res.Conn.RemotePeer() != w.peer {
+		res.Conn.Close()
+		tpt := w.s.TransportForDialing(res.Addr)
+		err := fmt.Errorf("BUG in transport %T: tried to dial %s, dialed %s", w.peer, res.Conn.RemotePeer(), tpt)
+		log.Error(err)
+		w.dispatchError(ad, err)
+		return
+	}
+
+	canonicallog.LogPeerStatus(100, res.Conn.RemotePeer(), res.Conn.RemoteMultiaddr(), "connection_status", "established", "dir", "outbound")
+	if w.s.metricsTracer != nil {
+		connWithMetrics := wrapWithMetrics(res.Conn, w.s.metricsTracer, ad.startTime, network.DirOutbound)
+		connWithMetrics.completedHandshake()
+		res.Conn = connWithMetrics
+	}
+
+	// we got a connection, add it to the swarm
+	conn, err := w.s.addConn(res.Conn, network.DirOutbound)
+	if err != nil {
+		// oops no, we failed to add it to the swarm
+		res.Conn.Close()
+		w.dispatchError(ad, err)
+		return
+	}
+	ad.conn = conn
+
+	for pr := range w.pendingRequests {
+		if pr.addrs[string(ad.addr.Bytes())] {
+			pr.req.resch <- dialResponse{conn: conn}
+			delete(w.pendingRequests, pr)
+		}
+	}
+
+	if !w.connected {
+		w.connected = true
+		if w.s.metricsTracer != nil {
+			w.s.metricsTracer.DialRankingDelay(ad.dialRankingDelay)
+		}
+	}
+}
+
+func (w *dialWorker) handleError(ad *addrDial, res dialResult) {
+	if res.Err != nil && w.s.metricsTracer != nil {
+		w.s.metricsTracer.FailedDialing(res.Addr, res.Err)
+	}
+	// it must be an error -- add backoff if applicable and dispatch
+	// ErrDialRefusedBlackHole shouldn't end up here, just a safety check
+	if res.Err != ErrDialRefusedBlackHole && res.Err != context.Canceled && !w.connected {
+		// we only add backoff if there has not been a successful connection
+		// for consistency with the old dialer behavior.
+		w.s.backf.AddBackoff(w.peer, res.Addr)
+	} else if res.Err == ErrDialRefusedBlackHole {
+		log.Errorf("SWARM BUG: unexpected ErrDialRefusedBlackHole while dialing peer %s to addr %s",
+			w.peer, res.Addr)
+	}
+	w.dispatchError(ad, res.Err)
 }
 
 // dispatches an error to a specific addr dial

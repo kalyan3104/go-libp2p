@@ -623,9 +623,11 @@ func checkDialWorkerLoopScheduling(t *testing.T, s1, s2 *Swarm, tc schedulingTes
 	go worker1.loop()
 	defer worker1.wg.Wait()
 	defer close(reqch)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// trigger the request
-	reqch <- dialRequest{ctx: context.Background(), resch: resch}
+	reqch <- dialRequest{ctx: ctx, resch: resch}
 
 	connected := false
 
@@ -989,8 +991,9 @@ func TestDialWorkerLoopHolePunching(t *testing.T) {
 	go worker.loop()
 	defer worker.wg.Wait()
 	defer close(reqch)
-
-	reqch <- dialRequest{ctx: context.Background(), resch: resch}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reqch <- dialRequest{ctx: ctx, resch: resch}
 	<-recvCh // received connection on t1
 
 	select {

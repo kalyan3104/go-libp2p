@@ -8,16 +8,9 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/transport"
 
 	ma "github.com/multiformats/go-multiaddr"
 )
-
-type dialResult struct {
-	Conn transport.CapableConn
-	Addr ma.Multiaddr
-	Err  error
-}
 
 type dialJob struct {
 	addr    ma.Multiaddr
@@ -45,7 +38,7 @@ type dialLimiter struct {
 	waitingOnPeerLimit map[peer.ID][]*dialJob
 }
 
-type dialfunc func(context.Context, peer.ID, ma.Multiaddr) (transport.CapableConn, error)
+type dialfunc func(context.Context, peer.ID, ma.Multiaddr, chan dialResult)
 
 func newDialLimiter(df dialfunc) *dialLimiter {
 	fd := ConcurrentFdDials
@@ -209,19 +202,9 @@ func (dl *dialLimiter) clearAllPeerDials(p peer.ID) {
 // it held during the dial.
 func (dl *dialLimiter) executeDial(j *dialJob) {
 	defer dl.finishedDial(j)
-	if j.cancelled() {
-		return
-	}
 
 	dctx, cancel := context.WithTimeout(j.ctx, j.timeout)
 	defer cancel()
 
-	con, err := dl.dialFunc(dctx, j.peer, j.addr)
-	select {
-	case j.resp <- dialResult{Conn: con, Addr: j.addr, Err: err}:
-	case <-j.ctx.Done():
-		if con != nil {
-			con.Close()
-		}
-	}
+	dl.dialFunc(dctx, j.peer, j.addr, j.resp)
 }
