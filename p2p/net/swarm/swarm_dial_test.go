@@ -372,5 +372,5 @@ func TestBlackHoledAddrBlocked(t *testing.T) {
 	if !errors.As(err, &de) {
 		t.Fatalf("expected to receive an error of type *DialError, got %s of type %T", err, err)
 	}
-	require.Contains(t, de.DialErrors, TransportError{Address: addr, Cause: ErrDialRefusedBlackHole})
+	require.ErrorIs(t, err, ErrDialRefusedBlackHole)
 }

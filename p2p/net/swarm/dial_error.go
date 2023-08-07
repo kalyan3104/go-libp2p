@@ -1,6 +1,7 @@
 package swarm
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -30,10 +31,7 @@ func (e *DialError) recordErr(addr ma.Multiaddr, err error) {
 		e.Skipped++
 		return
 	}
-	e.DialErrors = append(e.DialErrors, TransportError{
-		Address: addr,
-		Cause:   err,
-	})
+	e.DialErrors = append(e.DialErrors, TransportError{Address: addr, Cause: err})
 }
 
 func (e *DialError) Error() string {
@@ -51,9 +49,22 @@ func (e *DialError) Error() string {
 	return builder.String()
 }
 
-// Unwrap implements https://godoc.org/golang.org/x/xerrors#Wrapper.
-func (e *DialError) Unwrap() error {
-	return e.Cause
+func (e *DialError) Unwrap() []error {
+	if e == nil || len(e.DialErrors) == 0 {
+		return nil
+	}
+	errs := make([]error, len(e.DialErrors))
+	for i := 0; i < len(e.DialErrors); i++ {
+		errs[i] = &e.DialErrors[i]
+	}
+	return errs
+}
+
+func (e *DialError) Is(target error) bool {
+	if e == target {
+		return true
+	}
+	return e != nil && e.Cause != nil && errors.Is(e.Cause, target)
 }
 
 var _ error = (*DialError)(nil)
@@ -66,6 +77,10 @@ type TransportError struct {
 
 func (e *TransportError) Error() string {
 	return fmt.Sprintf("failed to dial %s: %s", e.Address, e.Cause)
+}
+
+func (e *TransportError) Unwrap() error {
+	return e.Cause
 }
 
 var _ error = (*TransportError)(nil)
