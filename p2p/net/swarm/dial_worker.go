@@ -170,9 +170,14 @@ loop:
 				continue loop
 			}
 
-			addrs, err := w.s.addrsForDial(req.ctx, w.peer)
+			addrs, addrErrs, err := w.s.addrsForDial(req.ctx, w.peer)
 			if err != nil {
-				req.resch <- dialResponse{err: err}
+				req.resch <- dialResponse{
+					err: &DialError{
+						Peer:       w.peer,
+						DialErrors: addrErrs,
+						Cause:      err,
+					}}
 				continue loop
 			}
 
@@ -184,7 +189,7 @@ loop:
 			// create the pending request object
 			pr := &pendRequest{
 				req:   req,
-				err:   &DialError{Peer: w.peer},
+				err:   &DialError{Peer: w.peer, DialErrors: addrErrs},
 				addrs: make(map[string]bool, len(addrRanking)),
 			}
 			for _, adelay := range addrRanking {
@@ -226,6 +231,7 @@ loop:
 
 			if len(todial) == 0 && len(tojoin) == 0 {
 				// all request applicable addrs have been dialed, we must have errored
+				pr.err.Cause = ErrAllDialsFailed
 				req.resch <- dialResponse{err: pr.err}
 				continue loop
 			}
@@ -376,6 +382,7 @@ func (w *dialWorker) dispatchError(ad *addrDial, err error) {
 				if c != nil {
 					pr.req.resch <- dialResponse{conn: c}
 				} else {
+					pr.err.Cause = ErrAllDialsFailed
 					pr.req.resch <- dialResponse{err: pr.err}
 				}
 				delete(w.pendingRequests, pr)
