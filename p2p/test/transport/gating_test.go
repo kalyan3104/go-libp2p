@@ -12,12 +12,12 @@ import (
 
 	"github.com/libp2p/go-libp2p-testing/race"
 
-	"github.com/golang/mock/gomock"
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 )
 
-//go:generate go run github.com/golang/mock/mockgen -package transport_integration -destination mock_connection_gater_test.go github.com/libp2p/go-libp2p/core/connmgr ConnectionGater
+//go:generate go run go.uber.org/mock/mockgen -package transport_integration -destination mock_connection_gater_test.go github.com/libp2p/go-libp2p/core/connmgr ConnectionGater
 
 func stripCertHash(addr ma.Multiaddr) ma.Multiaddr {
 	for {
