@@ -17,6 +17,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/transport"
+	"golang.org/x/exp/slices"
 
 	logging "github.com/ipfs/go-log/v2"
 	ma "github.com/multiformats/go-multiaddr"
@@ -172,6 +173,11 @@ type Swarm struct {
 		m map[network.Notifiee]struct{}
 	}
 
+	directConnNotifs struct {
+		sync.Mutex
+		m map[peer.ID][]chan struct{}
+	}
+
 	transports struct {
 		sync.RWMutex
 		m map[int]transport.Transport
@@ -231,6 +237,7 @@ func NewSwarm(local peer.ID, peers peerstore.Peerstore, eventBus event.Bus, opts
 	s.listeners.m = make(map[transport.Listener]struct{})
 	s.transports.m = make(map[int]transport.Transport)
 	s.notifs.m = make(map[network.Notifiee]struct{})
+	s.directConnNotifs.m = make(map[peer.ID][]chan struct{})
 
 	for _, opt := range opts {
 		if err := opt(s); err != nil {
@@ -390,6 +397,19 @@ func (s *Swarm) addConn(tc transport.CapableConn, dir network.Direction) (*Conn,
 	c.notifyLk.Lock()
 	s.conns.Unlock()
 
+	// Notify goroutines waiting for a direct connection
+
+	// Go routines interested in waiting for direct connection first acquire this lock and then
+	// acquire conns.RLock. Do not acquire this lock before conns.Unlock to prevent deadlock.
+	s.directConnNotifs.Lock()
+	if !c.Stat().Transient {
+		for _, ch := range s.directConnNotifs.m[p] {
+			close(ch)
+		}
+		delete(s.directConnNotifs.m, p)
+	}
+	s.directConnNotifs.Unlock()
+
 	// Emit event after releasing `s.conns` lock so that a consumer can still
 	// use swarm methods that need the `s.conns` lock.
 	if isFirstConnection {
@@ -435,46 +455,101 @@ func (s *Swarm) NewStream(ctx context.Context, p peer.ID) (network.Stream, error
 
 	// Algorithm:
 	// 1. Find the best connection, otherwise, dial.
-	// 2. Try opening a stream.
-	// 3. If the underlying connection is, in fact, closed, close the outer
+	// 2. If the best connection is transient, wait for a direct conn via conn
+	//    reversal or hole punching.
+	// 3. Try opening a stream.
+	// 4. If the underlying connection is, in fact, closed, close the outer
 	//    connection and try again. We do this in case we have a closed
 	//    connection but don't notice it until we actually try to open a
 	//    stream.
 	//
-	// Note: We only dial once.
-	//
 	// TODO: Try all connections even if we get an error opening a stream on
 	// a non-closed connection.
-	dials := 0
-	for {
-		// will prefer direct connections over relayed connections for opening streams
-		c := s.bestAcceptableConnToPeer(ctx, p)
-
+	dialed := false
+	for i := 0; i < 1; i++ {
+		c := s.bestConnToPeer(p)
 		if c == nil {
-			if nodial, _ := network.GetNoDial(ctx); nodial {
+			if nodial, _ := network.GetNoDial(ctx); !nodial {
+				if dialed {
+					return nil, errors.New("max dial attempts exceeded")
+				}
+				dialed = true
+				var err error
+				c, err = s.dialPeer(ctx, p)
+				if err != nil {
+					return nil, err
+				}
+			} else {
 				return nil, network.ErrNoConn
 			}
+		}
 
-			if dials >= DialAttempts {
-				return nil, errors.New("max dial attempts exceeded")
-			}
-			dials++
-
+		useTransient, _ := network.GetUseTransient(ctx)
+		if !useTransient && c.Stat().Transient {
 			var err error
-			c, err = s.dialPeer(ctx, p)
+			c, err = s.waitForDirectConn(ctx, p)
 			if err != nil {
 				return nil, err
 			}
 		}
 
-		s, err := c.NewStream(ctx)
+		str, err := c.NewStream(ctx)
 		if err != nil {
 			if c.conn.IsClosed() {
 				continue
 			}
 			return nil, err
 		}
-		return s, nil
+		return str, nil
+	}
+	return nil, network.ErrNoConn
+}
+
+// waitForDirectConn waits for a direct connection established through hole punching or connection reversal.
+func (s *Swarm) waitForDirectConn(ctx context.Context, p peer.ID) (*Conn, error) {
+	s.directConnNotifs.Lock()
+	c := s.bestConnToPeer(p)
+	if c == nil {
+		s.directConnNotifs.Unlock()
+		return nil, network.ErrNoConn
+	} else if !c.Stat().Transient {
+		s.directConnNotifs.Unlock()
+		return c, nil
+	}
+
+	// Wait for transient connection to upgrade to a direct connection either by
+	// connection reversal or hole punching.
+	ch := make(chan struct{})
+	s.directConnNotifs.m[p] = append(s.directConnNotifs.m[p], ch)
+	s.directConnNotifs.Unlock()
+
+	// Wait for notification.
+	// There's no point waiting for more than a minute here.
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	select {
+	case <-ctx.Done():
+		// Remove ourselves from the notification list
+		s.directConnNotifs.Lock()
+		s.directConnNotifs.m[p] = slices.DeleteFunc(
+			s.directConnNotifs.m[p],
+			func(c chan struct{}) bool { return c == ch },
+		)
+		if len(s.directConnNotifs.m[p]) == 0 {
+			delete(s.directConnNotifs.m, p)
+		}
+		s.directConnNotifs.Unlock()
+		return nil, ctx.Err()
+	case <-ch:
+		// We do not need to remove ourselves from the list here as the notifier
+		// clears the map
+		c := s.bestConnToPeer(p)
+		if c == nil {
+			return nil, network.ErrNoConn
+		} else if c.Stat().Transient {
+			return nil, network.ErrTransientConn
+		}
+		return c, nil
 	}
 }
 
