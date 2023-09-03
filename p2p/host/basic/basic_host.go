@@ -735,20 +735,8 @@ func (h *BasicHost) Connect(ctx context.Context, pi peer.AddrInfo) error {
 // the connection once it has been opened.
 func (h *BasicHost) dialPeer(ctx context.Context, p peer.ID) error {
 	log.Debugf("host %s dialing %s", h.ID(), p)
-	c, err := h.Network().DialPeer(ctx, p)
-	if err != nil {
+	if _, err := h.Network().DialPeer(ctx, p); err != nil {
 		return fmt.Errorf("failed to dial: %w", err)
-	}
-
-	// TODO: Consider removing this? On one hand, it's nice because we can
-	// assume that things like the agent version are usually set when this
-	// returns. On the other hand, we don't _really_ need to wait for this.
-	//
-	// This is mostly here to preserve existing behavior.
-	select {
-	case <-h.ids.IdentifyWait(c):
-	case <-ctx.Done():
-		return fmt.Errorf("identify failed to complete: %w", ctx.Err())
 	}
 
 	log.Debugf("host %s finished dialing %s", h.ID(), p)
