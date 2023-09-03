@@ -647,18 +647,6 @@ func (h *BasicHost) NewStream(ctx context.Context, p peer.ID, pids ...protocol.I
 		return nil, fmt.Errorf("failed to open stream: %w", err)
 	}
 
-	// Wait for any in-progress identifies on the connection to finish. This
-	// is faster than negotiating.
-	//
-	// If the other side doesn't support identify, that's fine. This will
-	// just be a no-op.
-	select {
-	case <-h.ids.IdentifyWait(s.Conn()):
-	case <-ctx.Done():
-		_ = s.Reset()
-		return nil, fmt.Errorf("identify failed to complete: %w", ctx.Err())
-	}
-
 	pref, err := h.preferredProtocol(p, pids)
 	if err != nil {
 		_ = s.Reset()

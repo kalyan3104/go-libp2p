@@ -535,8 +535,17 @@ func TestProtoDowngrade(t *testing.T) {
 	// This is _almost_ instantaneous, but this test fails once every ~1k runs without this.
 	time.Sleep(time.Millisecond)
 
+	sub, err := h1.EventBus().Subscribe(&event.EvtPeerIdentificationCompleted{})
+	require.NoError(t, err)
+	defer sub.Close()
+
 	h2pi := h2.Peerstore().PeerInfo(h2.ID())
 	require.NoError(t, h1.Connect(ctx, h2pi))
+	select {
+	case <-sub.Out():
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout")
+	}
 
 	s2, err := h1.NewStream(ctx, h2.ID(), "/testing/1.0.0", "/testing")
 	require.NoError(t, err)
