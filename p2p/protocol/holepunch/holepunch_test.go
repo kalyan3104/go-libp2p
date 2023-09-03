@@ -341,9 +341,10 @@ func TestFailuresOnResponder(t *testing.T) {
 			defer relay.Close()
 
 			s, err := h2.NewStream(network.WithUseTransient(context.Background(), "holepunch"), h1.ID(), holepunch.Protocol)
-			require.NoError(t, err)
-
-			go tc.initiator(s)
+			// h1 will reset the stream. This might or might not happen before multistream has finished.
+			if err == nil {
+				go tc.initiator(s)
+			}
 
 			getTracerError := func(tr *mockEventTracer) []string {
 				var errs []string
